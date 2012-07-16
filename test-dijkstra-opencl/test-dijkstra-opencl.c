@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <limits.h>
 
 #ifdef __APPLE__
   #include <OpenCL/cl.h>
@@ -239,7 +240,7 @@ cl_program load_and_build_program(cl_context context, cl_device_id device, char 
 
   check_error(err_num, CL_SUCCESS);
 
-  err_num = clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
+  err_num = clBuildProgram(program, 0, NULL, "-g", NULL, NULL);
   if (err_num != CL_SUCCESS)
    {
      size_t size;
@@ -248,7 +249,6 @@ cl_program load_and_build_program(cl_context context, cl_device_id device, char 
           &size);
       check_error(err_num, CL_SUCCESS);
 
-      printf("SIZE:%d\n", size);
       char *log = malloc(size+1);
 
       err_num = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, size, log,
@@ -264,7 +264,7 @@ cl_program load_and_build_program(cl_context context, cl_device_id device, char 
 
 int round_worksize_up(int group_size, int global_size)
 {
-  int remainder = global_size & group_size;
+  int remainder = global_size % group_size;
   if (!remainder)
     return global_size;
   else
@@ -281,10 +281,10 @@ void check_error_file_line(int err_num, int expected, const char* file, const
       exit(1);
     }
 }
-int maskArrayEmpty(int *maskArray, int count)
+int mask_array_empty(int *maskArray, int count)
 {
   int i;
-  for(i = 0; i < count; i++ )
+  for(i = 0; i < count; i++)
   {
       if (maskArray[i] == 1)
       {
@@ -295,6 +295,126 @@ int maskArrayEmpty(int *maskArray, int count)
   return 1;
 }
 
+void print_matrix(int *matrix, int size)
+{
+  int i;
+  for (i=0; i<size; i++)
+    {
+      printf("%d ", matrix[i]);
+    }
+  printf("\n");
+}
+
+void dijkstra_reference(int *edges, int *weights, int source_i, int source_j,
+    int *costs, int width, int height)
+{
+  unsigned int i, j, size, *mask_array;
+
+  size = width*height;
+  mask_array = malloc (size * sizeof (unsigned int));
+
+  for (i=0; i < width; i++)
+  {
+    for (j=0; j < height; j++)
+      {
+        if (i==source_i && j==source_j)
+          {
+            costs[j*width + i] = 0;
+            mask_array[j*width + i] = 1;
+          }
+        else
+          {
+            mask_array[j*width + i] = 0;
+          }
+      }
+  }
+
+  while (!mask_array_empty (mask_array, size))
+    {
+      int tid;
+      for (tid = 0; tid < size; tid++)
+        {
+          if (mask_array[tid] != 0)
+            {
+              mask_array[tid] = 0;
+
+              int edgeStart = tid * 8;
+              int edge;
+              for (edge=edgeStart; ((edge - edgeStart) < 8) && (edges[edge] !=
+                    -1); edge++)
+                {
+                  int nid = edges[edge];
+                  if (costs[nid] > (costs[tid] + weights[edge]) ||
+                      costs[nid] == -1)
+                    {
+                      costs[nid] = costs[tid] + weights[edge];
+                      mask_array[nid] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+  free(mask_array);
+  return;
+}
+
+
+cl_int ocl_set_up_context(cl_device_type device_type, cl_platform_id *platform, cl_context *context,
+    cl_device_id *device, cl_command_queue *command_queue)
+{
+  cl_int err_num;
+
+  cl_context_properties contextProperties[] =
+    {
+      CL_CONTEXT_PLATFORM,
+      (cl_context_properties)*platform,
+      0
+    };
+
+  *context = clCreateContextFromType(contextProperties, device_type,
+      NULL, NULL, &err_num);
+
+  if (err_num != CL_SUCCESS)
+    {
+      /* FIXME add rest of the devices */
+      if (device_type == CL_DEVICE_TYPE_CPU)
+        printf("No CPU devices found.\n");
+      else if (device_type == CL_DEVICE_TYPE_GPU)
+        printf("No GPU devices found.\n");
+    }
+
+  err_num = clGetDeviceIDs(*platform, device_type, 1, device, NULL);
+
+  if (err_num != CL_SUCCESS)
+    {
+      return err_num;
+    }
+
+  *command_queue = clCreateCommandQueue(*context, *device, 0, &err_num);
+
+  if (err_num != CL_SUCCESS)
+    {
+      return err_num;
+    }
+}
+
+int get_longer_distance(int *edge_matrix, int *distances, int matrix_size)
+{
+  int i, node, farthest_node;
+
+  farthest_node = -1;
+  for (i=0; i<matrix_size; i++)
+    {
+      node = i;
+      if (edge_matrix[node*8] != -1 &&
+          distances[farthest_node] < distances[node])
+        {
+          farthest_node = node;
+        }
+    }
+  return farthest_node;
+}
 
 int main(int argc, char **argv)
 {
@@ -313,7 +433,7 @@ int main(int argc, char **argv)
   cl_int err_num;
   cl_platform_id platform;
   cl_device_id device;
-  cl_context cpuContext;
+  cl_context context;
   cl_command_queue command_queue;
 
   cl_program program;
@@ -336,9 +456,9 @@ int main(int argc, char **argv)
   int *weight_matrix = malloc(matrix_size * 8 * sizeof(int));
   int *cost_matrix = malloc(matrix_size * sizeof(int));
   int *updating_cost_matrix = malloc(matrix_size * sizeof(int));
-
   int *mask_matrix = malloc(matrix_size * sizeof(int));
-  mask_matrix[10] = 800;
+
+  int *previous_matrix = malloc(matrix_size * sizeof(int));
 
   for (i=0; i<matrix_size; i++)
     {
@@ -349,8 +469,8 @@ int main(int argc, char **argv)
         }
       else
         {
-          cost_matrix[i] = -1;
-          updating_cost_matrix[i] = -1;
+          cost_matrix[i] = INT_MAX;
+          updating_cost_matrix[i] = INT_MAX;
         }
     }
 
@@ -361,7 +481,7 @@ int main(int argc, char **argv)
     i++;
   }
 
-  i=0;
+  i = 0;
 
   while (fgets(line, 10, weight_f) != NULL) {
     weight_matrix[i] = atoi(line);
@@ -375,30 +495,13 @@ int main(int argc, char **argv)
       return 1;
     }
 
-  cl_context_properties contextProperties[] =
-    {
-      CL_CONTEXT_PLATFORM,
-      (cl_context_properties)platform,
-      0
-    };
-
-  cpuContext = clCreateContextFromType(contextProperties, CL_DEVICE_TYPE_CPU,
-      NULL, NULL, &err_num);
-
-
-  if (err_num != CL_SUCCESS)
-    {
-      printf("No CPU devices found.\n");
-    }
-
-  err_num = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL);
-
+  err_num = ocl_set_up_context(CL_DEVICE_TYPE_CPU, &platform, &context, &device, &command_queue);
   check_error(err_num, CL_SUCCESS);
 
-  command_queue = clCreateCommandQueue(cpuContext, device, 0, &err_num);
+  program = load_and_build_program(context, device, "dijkstra.cl");
 
-  program = load_and_build_program(cpuContext, device, "dijkstra.cl");
 
+/*
   size_t max_workgroup_size;
 
   err_num = clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t),
@@ -408,42 +511,55 @@ int main(int argc, char **argv)
 
   size_t local_worksize = max_workgroup_size;
   size_t global_worksize = round_worksize_up(local_worksize, matrix_size);
-
+*/
   cl_mem edge_matrix_device;
   cl_mem weight_matrix_device;
   cl_mem mask_matrix_device;
   cl_mem cost_matrix_device;
   cl_mem updating_cost_matrix_device;
+  cl_mem previous_matrix_device;
 
-  edge_matrix_device = clCreateBuffer(cpuContext, CL_MEM_READ_ONLY, sizeof(int)
+  edge_matrix_device = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(int)
       * matrix_size * 8, NULL, &err_num);
   check_error(err_num, CL_SUCCESS);
 
-  weight_matrix_device = clCreateBuffer(cpuContext, CL_MEM_READ_ONLY,
+  weight_matrix_device = clCreateBuffer(context, CL_MEM_READ_ONLY,
       sizeof(int) * matrix_size * 8, NULL, &err_num);
   check_error(err_num, CL_SUCCESS);
 
-  mask_matrix_device = clCreateBuffer(cpuContext, CL_MEM_READ_WRITE, sizeof(int)
+  mask_matrix_device = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int)
       * matrix_size, NULL, &err_num);
   check_error(err_num, CL_SUCCESS);
 
-  cost_matrix_device = clCreateBuffer(cpuContext, CL_MEM_READ_WRITE, sizeof(int)
+  cost_matrix_device = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int)
       * matrix_size, NULL, &err_num);
   check_error(err_num, CL_SUCCESS);
 
-  updating_cost_matrix_device = clCreateBuffer(cpuContext, CL_MEM_READ_WRITE, sizeof(int)
+  updating_cost_matrix_device = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int)
       * matrix_size, NULL, &err_num);
+  check_error(err_num, CL_SUCCESS);
+
+  previous_matrix_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
+      sizeof(int) * matrix_size, NULL, &err_num);
   check_error(err_num, CL_SUCCESS);
 
 
   err_num = clEnqueueWriteBuffer(command_queue, edge_matrix_device, CL_TRUE, 0,
-      global_worksize*8, edge_matrix, 0, NULL, NULL);
+      sizeof(int) * matrix_size*8, edge_matrix, 0, NULL, NULL);
+  check_error(err_num, CL_SUCCESS);
   err_num = clEnqueueWriteBuffer(command_queue, weight_matrix_device, CL_TRUE, 0,
-      global_worksize*8, weight_matrix, 0, NULL, NULL);
+      sizeof(int) * matrix_size*8, weight_matrix, 0, NULL, NULL);
+  check_error(err_num, CL_SUCCESS);
   err_num = clEnqueueWriteBuffer(command_queue, cost_matrix_device, CL_TRUE, 0,
-      global_worksize, cost_matrix, 0, NULL, NULL);
+      sizeof(int) * matrix_size, cost_matrix, 0, NULL, NULL);
+  check_error(err_num, CL_SUCCESS);
   err_num = clEnqueueWriteBuffer(command_queue, updating_cost_matrix_device, CL_TRUE, 0,
-      global_worksize, updating_cost_matrix, 0, NULL, NULL);
+      sizeof(int) * matrix_size, updating_cost_matrix, 0, NULL, NULL);
+  check_error(err_num, CL_SUCCESS);
+
+  size_t local_worksize = 1;
+  size_t global_worksize = matrix_size;
+  cl_event read_done;
 
   cl_kernel initialize_buffers_kernel;
   initialize_buffers_kernel = clCreateKernel(program, "initialize_buffers",
@@ -452,22 +568,23 @@ int main(int argc, char **argv)
 
   err_num |= clSetKernelArg(initialize_buffers_kernel, 0, sizeof(cl_mem),
       &mask_matrix_device);
-  err_num |= clSetKernelArg(initialize_buffers_kernel, 1, sizeof(int), &source_vertex);
+  err_num |= clSetKernelArg(initialize_buffers_kernel, 1, sizeof(cl_mem),
+      &cost_matrix_device);
+  err_num |= clSetKernelArg(initialize_buffers_kernel, 2, sizeof(cl_mem),
+      &updating_cost_matrix_device);
+  err_num |= clSetKernelArg(initialize_buffers_kernel, 3, sizeof(cl_mem),
+      &previous_matrix_device);
+  err_num |= clSetKernelArg(initialize_buffers_kernel, 4, sizeof(int), &source_vertex);
   check_error(err_num, CL_SUCCESS);
 
-  local_worksize = 1;
-  global_worksize = matrix_size;
-
-  err_num = clEnqueueNDRangeKernel(command_queue, initialize_buffers_kernel, 1, NULL,
-      &global_worksize, &local_worksize, 0, NULL, NULL);
+  cl_kernel set_longer_node_kernel;
+  set_longer_node_kernel = clCreateKernel(program, "set_longer_node",
+      &err_num);
   check_error(err_num, CL_SUCCESS);
 
-  cl_event read_done;
-  err_num = clEnqueueReadBuffer(command_queue, mask_matrix_device, CL_FALSE, 0,
-      sizeof(int) * global_worksize, mask_matrix, 0, NULL, &read_done);
+  err_num |= clSetKernelArg(set_longer_node_kernel, 0, sizeof(cl_mem),
+      &cost_matrix_device);
   check_error(err_num, CL_SUCCESS);
-
-  clWaitForEvents(1, &read_done);
 
   cl_kernel dijkstra_kernel1;
   dijkstra_kernel1 = clCreateKernel(program, "dijkstra1", &err_num);
@@ -484,7 +601,10 @@ int main(int argc, char **argv)
   err_num |= clSetKernelArg(dijkstra_kernel1, 2, sizeof(cl_mem), &mask_matrix_device);
   err_num |= clSetKernelArg(dijkstra_kernel1, 3, sizeof(cl_mem), &cost_matrix_device);
   err_num |= clSetKernelArg(dijkstra_kernel1, 4, sizeof(cl_mem), &updating_cost_matrix_device);
-  err_num |= clSetKernelArg(dijkstra_kernel1, 5, sizeof(int), &matrix_size);
+  err_num |= clSetKernelArg(dijkstra_kernel1, 5, sizeof(cl_mem),
+      &previous_matrix_device);
+  err_num |= clSetKernelArg(dijkstra_kernel1, 6, sizeof(int), &matrix_size);
+  check_error(err_num, CL_SUCCESS);
 
   err_num |= clSetKernelArg(dijkstra_kernel2, 0, sizeof(cl_mem),
       &cost_matrix_device);
@@ -492,37 +612,105 @@ int main(int argc, char **argv)
       &updating_cost_matrix_device);
   err_num |= clSetKernelArg(dijkstra_kernel2, 2, sizeof(cl_mem),
       &mask_matrix_device);
+  check_error(err_num, CL_SUCCESS);
 
-  while (!maskArrayEmpty(mask_matrix, matrix_size))
+  int nr_nodes, node;
+  for (nr_nodes = 3; nr_nodes>0; nr_nodes--)
     {
-      err_num = clEnqueueNDRangeKernel(command_queue, dijkstra_kernel1, 1, NULL,
-          &global_worksize, &local_worksize, 0, NULL, NULL);
+      err_num |= clSetKernelArg(initialize_buffers_kernel, 4, sizeof(int),
+          &source_vertex);
       check_error(err_num, CL_SUCCESS);
 
-      err_num = clEnqueueNDRangeKernel(command_queue, dijkstra_kernel2, 1, NULL,
-          &global_worksize, &local_worksize, 0, NULL, NULL);
+      err_num = clEnqueueNDRangeKernel(command_queue, initialize_buffers_kernel, 1, NULL,
+      &global_worksize, NULL, 0, NULL, NULL);
       check_error(err_num, CL_SUCCESS);
 
       err_num = clEnqueueReadBuffer(command_queue, mask_matrix_device, CL_FALSE, 0,
-      sizeof(int) * matrix_size, mask_matrix, 0, NULL, &read_done);
+          sizeof(int) * matrix_size, mask_matrix, 0, NULL, &read_done);
       check_error(err_num, CL_SUCCESS);
 
       clWaitForEvents(1, &read_done);
+
+      while (!mask_array_empty(mask_matrix, matrix_size))
+        {
+          err_num = clEnqueueNDRangeKernel(command_queue, dijkstra_kernel1, 1, NULL,
+              &global_worksize, NULL, 0, NULL, NULL);
+          check_error(err_num, CL_SUCCESS);
+
+          err_num = clEnqueueNDRangeKernel(command_queue, dijkstra_kernel2, 1, NULL,
+              &global_worksize, NULL, 0, NULL, NULL);
+          check_error(err_num, CL_SUCCESS);
+
+          err_num = clEnqueueReadBuffer(command_queue, mask_matrix_device, CL_FALSE, 0,
+          sizeof(int) * matrix_size, mask_matrix, 0, NULL, &read_done);
+          check_error(err_num, CL_SUCCESS);
+
+          clWaitForEvents(1, &read_done);
+        }
+      err_num = clEnqueueReadBuffer(command_queue, cost_matrix_device, CL_FALSE, 0,
+                sizeof(int) * matrix_size, cost_matrix, 0, NULL, &read_done);
+
+      check_error(err_num, CL_SUCCESS);
+
+      clWaitForEvents(1, &read_done);
+
+      err_num |= clSetKernelArg(set_longer_node_kernel, 1, sizeof(int), &node);
+
+      check_error(err_num, CL_SUCCESS);
+      node = get_longer_distance(edge_matrix, cost_matrix, matrix_size);
+
+      err_num |= clSetKernelArg(set_longer_node_kernel, 1, sizeof(int), &node);
+      check_error(err_num, CL_SUCCESS);
+
+      err_num = clEnqueueNDRangeKernel(command_queue, set_longer_node_kernel,
+          1, NULL, &global_worksize, NULL, 0, NULL, NULL);
+
+      source_vertex = node;
     }
+  int j, cost;
+
+  /*err_num = clEnqueueReadBuffer(command_queue, previous_matrix_device,
+      CL_FALSE, 0, sizeof(int) * matrix_size, previous_matrix, 0, NULL,
+      &read_done);
+  check_error(err_num, CL_SUCCESS);
+
+  clWaitForEvents(err_num, CL_SUCCESS);*/
+/*
+  printf("\n\n\n");
+
+  int j, cost;
+
+  for (i=0; i < width; i++)
+    {
+      for (j=0; j < height; j++)
+        {
+          printf("%d ", previous_matrix[j*width+i]);
+        }
+      printf("\n");
+    }
+*/
+/*  dijkstra_reference(edge_matrix, weight_matrix, source_i, source_j,
+      cost_matrix, width, height);*/
 
   err_num = clEnqueueReadBuffer(command_queue, cost_matrix_device, CL_FALSE, 0,
-      sizeof(int) * matrix_size, cost_matrix, 0, NULL, &read_done);
+          sizeof(int) * matrix_size, cost_matrix, 0, NULL, &read_done);
 
   check_error(err_num, CL_SUCCESS);
 
   clWaitForEvents(1, &read_done);
 
-  int j;
   for (i=0; i < width; i++)
     {
       for (j=0; j < height; j++)
         {
-          printf("%d ", cost_matrix[j*width + i]);
+          if ((cost = cost_matrix[j*width+i]) == INT_MAX)
+            {
+              printf("-1 ");
+            }
+          else
+            {
+              printf("%d ", cost_matrix[j*width + i]);
+            }
         }
       printf("\n");
     }
